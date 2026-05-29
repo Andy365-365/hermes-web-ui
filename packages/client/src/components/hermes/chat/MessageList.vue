@@ -8,8 +8,10 @@ import thinkingImageLight from "@/assets/thinking-light.gif";
 import thinkingImageDark from "@/assets/thinking-dark.gif";
 import { useTheme } from "@/composables/useTheme";
 import { useToolTraceVisibility } from "@/composables/useToolTraceVisibility";
+import { useProfilesStore } from "@/stores/hermes/profiles";
 
 const chatStore = useChatStore();
+const profilesStore = useProfilesStore();
 const { t } = useI18n();
 const { isDark } = useTheme();
 const { toolTraceVisible } = useToolTraceVisibility();
@@ -71,6 +73,15 @@ const queuedMessages = computed(() => {
   const sid = chatStore.activeSessionId;
   if (!sid) return [];
   return chatStore.queuedUserMessages.get(sid) || [];
+});
+
+const thinkingImageUrl = computed(() => {
+  const ta = profilesStore.activeProfile?.thinkingAnimation;
+  const enabled = ta?.enableThinking ?? true;
+  if (!enabled) return null;
+  const custom = ta?.url;
+  if (custom) return custom;
+  return isDark.value ? thinkingImageDark : thinkingImageLight;
 });
 
 function removeQueuedMessage(messageId: string) {
@@ -196,9 +207,9 @@ defineExpose({
     </template>
     <template #after>
       <Transition name="fade">
-      <div v-if="chatStore.isRunActive || chatStore.abortState" class="streaming-indicator">
+      <div v-if="(chatStore.isRunActive || chatStore.abortState) && thinkingImageUrl" class="streaming-indicator">
         <img
-          :src="isDark ? thinkingImageDark : thinkingImageLight"
+          :src="thinkingImageUrl"
           alt=""
           aria-hidden="true"
           class="thinking-video"
