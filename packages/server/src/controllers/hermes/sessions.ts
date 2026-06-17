@@ -1,5 +1,5 @@
 import * as hermesCli from '../../services/hermes/hermes-cli'
-import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb, getSessionDetailFromDbWithProfile, getExactSessionDetailFromDbWithProfile } from '../../db/hermes/sessions-db'
+import { listSessionSummaries, getUsageStatsFromDb, getSessionDetailFromDb, getSessionDetailFromDbWithProfile, getSessionDetailPaginatedFromDbWithProfile, getExactSessionDetailFromDbWithProfile } from '../../db/hermes/sessions-db'
 import {
   listSessions as localListSessions,
   searchSessions as localSearchSessions,
@@ -23,6 +23,7 @@ import { logger } from '../../services/logger'
 import type { ConversationSummary } from '../../services/hermes/conversations'
 import { listUserProfiles } from '../../db/hermes/users-store'
 import { readConfigYamlForProfile } from '../../services/config-helpers'
+import { codingAgentRunManager } from '../../services/agent-runner/coding-agent-run-manager'
 
 function getPendingDeletedSessionIds(): Set<string> {
   return getGroupChatServer()?.getStorage().getPendingDeletedSessionIds() || new Set<string>()
@@ -253,6 +254,10 @@ export async function listConversations(ctx: any) {
     id: s.id,
     profile: s.profile || null,
     source: s.source,
+    agent: s.agent,
+    agent_mode: s.agent_mode,
+    agent_session_id: s.agent_session_id,
+    agent_native_session_id: s.agent_native_session_id,
     model: s.model,
     provider: s.provider,
     title: s.title,
@@ -319,7 +324,7 @@ export async function list(ctx: any) {
   const knownProfiles = profile ? null : new Set(listProfileNamesFromDisk())
   ctx.body = {
     sessions: filterPendingDeletedSessions(filterByAllowedProfiles(ctx, allSessions).filter(s =>
-      (s.source === 'api_server' || s.source === 'cli') &&
+      (s.source === 'api_server' || s.source === 'cli' || s.source === 'coding_agent') &&
       (!knownProfiles || knownProfiles.has(s.profile || 'default')),
     )),
   }
@@ -511,7 +516,11 @@ export async function remove(ctx: any) {
   const existing = localGetSession(sessionId)
   if (denySessionAccess(ctx, existing)) return
   const hermesProfile = requestedProfile(ctx) || existing?.profile || getActiveProfileName()
-  const hermes = await deleteHermesSessionIfPresent(sessionId, hermesProfile)
+  const isCodingAgentSession = existing?.source === 'coding_agent'
+  if (isCodingAgentSession) codingAgentRunManager.stop(sessionId, { reportClosed: false })
+  const hermes = isCodingAgentSession
+    ? { attempted: false, deleted: false, profile: hermesProfile }
+    : await deleteHermesSessionIfPresent(sessionId, hermesProfile)
   const localDeleted = existing ? localDeleteSession(sessionId) : true
   if (!localDeleted) {
     ctx.status = 500
@@ -577,7 +586,11 @@ export async function batchRemove(ctx: any) {
       continue
     }
 
-    const hermes = await deleteHermesSessionIfPresent(id, targetProfile)
+    const isCodingAgentSession = existing?.source === 'coding_agent'
+    if (isCodingAgentSession) codingAgentRunManager.stop(id, { reportClosed: false })
+    const hermes = isCodingAgentSession
+      ? { attempted: false, deleted: false, profile: targetProfile || 'default' }
+      : await deleteHermesSessionIfPresent(id, targetProfile)
     if (hermes.deleted) {
       results.hermesDeleted++
     } else if (hermes.attempted && hermes.error) {
@@ -752,14 +765,15 @@ export async function usageStats(ctx: any) {
 /**
  * List folders under workspace base path for folder picker.
  * GET /api/hermes/workspace/folders?path=<relative_path>
- * Base: /opt/data/workspace (overridable via WORKSPACE_BASE env)
+ * Base: current user's home directory (overridable via WORKSPACE_BASE env)
  */
 export async function listWorkspaceFolders(ctx: any) {
   const { resolve, join } = await import('path')
   const { readdir } = await import('fs/promises')
   const { existsSync } = await import('fs')
+  const { homedir } = await import('os')
 
-  const WORKSPACE_BASE = process.env.WORKSPACE_BASE || '/opt/data/workspace'
+  const WORKSPACE_BASE = process.env.WORKSPACE_BASE?.trim() || homedir()
   const subPath = (ctx.query.path as string) || ''
 
   // Security: prevent path traversal
@@ -791,6 +805,132 @@ export async function listWorkspaceFolders(ctx: any) {
   } catch (err: any) {
     ctx.status = 500
     ctx.body = { error: err.message }
+  }
+}
+
+function invalidWorkspaceFolderName(name: string): boolean {
+  return !name ||
+    name === '.' ||
+    name === '..' ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    name.includes('\0')
+}
+
+async function resolveWorkspaceFolderPath(ctx: any, inputPath: string) {
+  const { resolve, join } = await import('path')
+  const { homedir } = await import('os')
+  const WORKSPACE_BASE = process.env.WORKSPACE_BASE?.trim() || homedir()
+  const fullPath = resolve(join(WORKSPACE_BASE, inputPath || ''))
+  if (!isPathWithin(fullPath, WORKSPACE_BASE)) {
+    ctx.status = 403
+    ctx.body = { error: 'Access denied' }
+    return null
+  }
+  return { base: WORKSPACE_BASE, fullPath }
+}
+
+export async function createWorkspaceFolder(ctx: any) {
+  const { join } = await import('path')
+  const { mkdir } = await import('fs/promises')
+  const { parentPath, name } = ctx.request.body as { parentPath?: string; name?: string }
+  const folderName = String(name || '').trim()
+  if (invalidWorkspaceFolderName(folderName)) {
+    ctx.status = 400
+    ctx.body = { error: 'Invalid folder name' }
+    return
+  }
+
+  const resolvedParent = await resolveWorkspaceFolderPath(ctx, String(parentPath || ''))
+  if (!resolvedParent) return
+  const targetPath = join(resolvedParent.fullPath, folderName)
+  if (!isPathWithin(targetPath, resolvedParent.base)) {
+    ctx.status = 403
+    ctx.body = { error: 'Access denied' }
+    return
+  }
+
+  try {
+    await mkdir(targetPath)
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    ctx.status = err?.code === 'EEXIST' ? 409 : 500
+    ctx.body = { error: err.message || 'Failed to create folder' }
+  }
+}
+
+export async function renameWorkspaceFolder(ctx: any) {
+  const { dirname, join } = await import('path')
+  const { rename, stat } = await import('fs/promises')
+  const { path, name } = ctx.request.body as { path?: string; name?: string }
+  const folderName = String(name || '').trim()
+  const currentPath = String(path || '').trim()
+  if (!currentPath) {
+    ctx.status = 400
+    ctx.body = { error: 'Path is required' }
+    return
+  }
+  if (invalidWorkspaceFolderName(folderName)) {
+    ctx.status = 400
+    ctx.body = { error: 'Invalid folder name' }
+    return
+  }
+
+  const resolvedCurrent = await resolveWorkspaceFolderPath(ctx, currentPath)
+  if (!resolvedCurrent) return
+  const parentPath = dirname(resolvedCurrent.fullPath)
+  const targetPath = join(parentPath, folderName)
+  if (!isPathWithin(targetPath, resolvedCurrent.base)) {
+    ctx.status = 403
+    ctx.body = { error: 'Access denied' }
+    return
+  }
+
+  try {
+    const info = await stat(resolvedCurrent.fullPath)
+    if (!info.isDirectory()) {
+      ctx.status = 400
+      ctx.body = { error: 'Path is not a directory' }
+      return
+    }
+    await rename(resolvedCurrent.fullPath, targetPath)
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    ctx.status = err?.code === 'EEXIST' ? 409 : err?.code === 'ENOENT' ? 404 : 500
+    ctx.body = { error: err.message || 'Failed to rename folder' }
+  }
+}
+
+export async function deleteWorkspaceFolder(ctx: any) {
+  const { rm, stat } = await import('fs/promises')
+  const { path } = ctx.request.body as { path?: string }
+  const currentPath = String(path || '').trim()
+  if (!currentPath) {
+    ctx.status = 400
+    ctx.body = { error: 'Path is required' }
+    return
+  }
+
+  const resolvedCurrent = await resolveWorkspaceFolderPath(ctx, currentPath)
+  if (!resolvedCurrent) return
+  if (resolvedCurrent.fullPath === resolvedCurrent.base) {
+    ctx.status = 400
+    ctx.body = { error: 'Cannot delete workspace root' }
+    return
+  }
+
+  try {
+    const info = await stat(resolvedCurrent.fullPath)
+    if (!info.isDirectory()) {
+      ctx.status = 400
+      ctx.body = { error: 'Path is not a directory' }
+      return
+    }
+    await rm(resolvedCurrent.fullPath, { recursive: true })
+    ctx.body = { ok: true }
+  } catch (err: any) {
+    ctx.status = err?.code === 'ENOENT' ? 404 : 500
+    ctx.body = { error: err.message || 'Failed to delete folder' }
   }
 }
 
@@ -871,30 +1011,36 @@ function serializeAsText(title: string | null, messages: any[]): string {
 
 export async function getConversationMessagesPaginated(ctx: any) {
   const offset = ctx.query.offset ? parseInt(ctx.query.offset as string, 10) : 0
-  const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : 50
+  const limit = ctx.query.limit ? parseInt(ctx.query.limit as string, 10) : 150
+  const profile = requestedProfile(ctx)
 
   const { getSessionDetailPaginated } = await import('../../db/hermes/session-store')
-  const result = getSessionDetailPaginated(ctx.params.id, offset, limit)
+  const localResult = getSessionDetailPaginated(ctx.params.id, offset, limit)
+  const result = localResult && (!profile || localResult.session.profile === profile)
+    ? localResult
+    : await getSessionDetailPaginatedFromDbWithProfile(ctx.params.id, profile || 'default', offset, limit)
 
   if (!result) {
     ctx.status = 404
     ctx.body = { error: 'Conversation not found' }
     return
   }
-  if (denySessionAccess(ctx, result.session)) return
+  const session = { ...result.session, profile: (result.session as any).profile || profile || 'default' }
+  if (denySessionAccess(ctx, session)) return
 
   ctx.body = {
     session: {
-      id: result.session.id,
-      source: result.session.source,
-      model: result.session.model,
-      title: result.session.title,
-      started_at: result.session.started_at,
-      ended_at: result.session.ended_at,
-      last_active: result.session.last_active,
-      message_count: result.session.message_count,
-      input_tokens: result.session.input_tokens,
-      output_tokens: result.session.output_tokens,
+      id: session.id,
+      profile: session.profile,
+      source: session.source,
+      model: session.model,
+      title: session.title,
+      started_at: session.started_at,
+      ended_at: session.ended_at,
+      last_active: session.last_active,
+      message_count: session.message_count,
+      input_tokens: session.input_tokens,
+      output_tokens: session.output_tokens,
     },
     messages: result.messages,
     total: result.total,

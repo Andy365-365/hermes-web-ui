@@ -13,6 +13,8 @@ export interface SessionMessage {
   session_id: string
   role: string
   content: string
+  display_role?: string | null
+  display_content?: string | null
   runMarker?: string
   tool_call_id?: string | null
   tool_calls?: any[] | null
@@ -36,7 +38,17 @@ export interface QueuedRun {
   model_groups?: Array<{ provider: string; models: string[] }>
   instructions?: string
   profile: string
+  workspace?: string | null
   source?: ChatRunSource
+  codingAgentId?: 'claude-code' | 'codex'
+  agentId?: 'claude-code' | 'codex'
+  mode?: 'scoped' | 'global'
+  baseUrl?: string
+  base_url?: string
+  apiKey?: string
+  api_key?: string
+  apiMode?: string
+  api_mode?: string
   originSocketId?: string
   goalContinuation?: boolean
 }
@@ -78,6 +90,8 @@ export interface SessionState {
 export interface ResponseRunState {
   runMarker?: string
   responseId?: string
+  reasoningMessageId?: number | string
+  pendingReasoning?: string
   insertedKeys: Set<string>
   toolCalls: Map<string, any>
 }
@@ -94,7 +108,7 @@ export interface BridgeContextState {
   provider?: string
 }
 
-export type ChatRunSource = 'api_server' | 'cli'
+export type ChatRunSource = 'api_server' | 'cli' | 'coding_agent'
 
 export interface BridgeCompressionResult {
   messages: ChatMessage[]

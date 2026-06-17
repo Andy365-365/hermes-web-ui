@@ -59,6 +59,7 @@ function makeContext(state: any, commandResult: Record<string, unknown> = {
   const runQueuedItem = vi.fn()
   const bridge = {
     command: vi.fn(async () => commandResult),
+    mcpReload: vi.fn(async () => ({ ok: true, message: 'MCP servers reloaded' })),
     status: vi.fn(async () => ({
       exists: true,
       running: false,
@@ -110,6 +111,115 @@ describe('plan session command', () => {
       })],
     }))
     expect(namespaceEmit).not.toHaveBeenCalledWith('session.command', expect.anything())
+  })
+
+  it('starts an idle /skill command with expanded storage and visible command display', async () => {
+    const state = { messages: [], isWorking: false, events: [], queue: [] }
+    const { bridge, namespaceEmit, nsp, runQueuedItem, sessionMap, socket } = makeContext(state, {
+      handled: true,
+      type: 'skill',
+      message: '[IMPORTANT: expanded skill prompt]',
+    })
+    const { handleSessionCommand, parseSessionCommand } = await import('../../packages/server/src/services/hermes/run-chat/session-command')
+    const command = parseSessionCommand('/skill github-pr-review check PR 123')!
+
+    await handleSessionCommand('session-1', command, {
+      nsp: nsp as any,
+      socket: socket as any,
+      sessionMap,
+      bridge: bridge as any,
+      profile: 'work',
+      queueId: 'skill-queue-id',
+      runQueuedItem,
+    })
+
+    expect(bridge.command).toHaveBeenCalledWith('session-1', '/github-pr-review check PR 123', 'work')
+    expect(addMessageMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      role: 'command',
+      content: '/skill github-pr-review check PR 123',
+    }))
+    expect(addMessageMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      content: '[IMPORTANT: expanded skill prompt]',
+    }))
+    expect(namespaceEmit).toHaveBeenCalledWith('session.command', expect.objectContaining({
+      action: 'skill',
+      started: true,
+    }))
+    expect(runQueuedItem).toHaveBeenCalledWith(socket, 'session-1', expect.objectContaining({
+      queue_id: 'skill-queue-id',
+      input: '[IMPORTANT: expanded skill prompt]',
+      displayInput: '/skill github-pr-review check PR 123',
+      displayRole: 'command',
+      storageMessage: '[IMPORTANT: expanded skill prompt]',
+      profile: 'work',
+    }), 'work')
+  })
+
+  it('queues /skill commands while the bridge session is running', async () => {
+    const state = { messages: [], isWorking: true, events: [], queue: [] }
+    const { bridge, namespaceEmit, nsp, runQueuedItem, sessionMap, socket } = makeContext(state, {
+      handled: true,
+      type: 'skill',
+      message: '[IMPORTANT: expanded skill prompt]',
+    })
+    const { handleSessionCommand, parseSessionCommand } = await import('../../packages/server/src/services/hermes/run-chat/session-command')
+    const command = parseSessionCommand('/skill review follow up')!
+
+    await handleSessionCommand('session-1', command, {
+      nsp: nsp as any,
+      socket: socket as any,
+      sessionMap,
+      bridge: bridge as any,
+      profile: 'default',
+      queueId: 'queued-skill',
+      runQueuedItem,
+    })
+
+    expect(runQueuedItem).not.toHaveBeenCalled()
+    expect(bridge.command).toHaveBeenCalledWith('session-1', '/review follow up', 'default')
+    expect(addMessageMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      role: 'command',
+      content: '/skill review follow up',
+    }))
+    expect(state.queue).toEqual([expect.objectContaining({
+      queue_id: 'queued-skill',
+      input: '[IMPORTANT: expanded skill prompt]',
+      displayInput: '/skill review follow up',
+      displayRole: 'command',
+      storageMessage: '[IMPORTANT: expanded skill prompt]',
+    })])
+    expect(namespaceEmit).toHaveBeenCalledWith('run.queued', expect.objectContaining({
+      queued_messages: [expect.objectContaining({
+        id: 'queued-skill',
+        role: 'command',
+        content: '/skill review follow up',
+      })],
+    }))
+  })
+
+  it('keeps unknown slash commands on the existing unknown-command path', async () => {
+    const state = { messages: [], isWorking: false, events: [], queue: [] }
+    const { bridge, namespaceEmit, nsp, runQueuedItem, sessionMap, socket } = makeContext(state)
+    const { handleSessionCommand, parseSessionCommand } = await import('../../packages/server/src/services/hermes/run-chat/session-command')
+    const command = parseSessionCommand('/not-a-command test')!
+
+    await handleSessionCommand('session-1', command, {
+      nsp: nsp as any,
+      socket: socket as any,
+      sessionMap,
+      bridge: bridge as any,
+      profile: 'default',
+      runQueuedItem,
+    })
+
+    expect(bridge.command).not.toHaveBeenCalled()
+    expect(runQueuedItem).not.toHaveBeenCalled()
+    expect(namespaceEmit).toHaveBeenCalledWith('session.command', expect.objectContaining({
+      command: 'not-a-command',
+      action: 'error',
+      message: 'Unknown bridge command: /not-a-command',
+      terminal: true,
+    }))
   })
 
   it('starts an idle goal command as a hidden kickoff run', async () => {
@@ -301,6 +411,32 @@ describe('plan session command', () => {
         running: true,
         currentRunId: 'run-123',
       }),
+    }))
+  })
+
+  it('rejects MCP reload while the session is running', async () => {
+    const state = { messages: [], isWorking: true, events: [], queue: [] }
+    const { bridge, namespaceEmit, runQueuedItem, sessionMap, socket, nsp } = makeContext(state)
+    const { handleSessionCommand, parseSessionCommand } = await import('../../packages/server/src/services/hermes/run-chat/session-command')
+    const command = parseSessionCommand('/reload-mcp github')!
+
+    await handleSessionCommand('session-1', command, {
+      nsp: nsp as any,
+      socket: socket as any,
+      sessionMap,
+      bridge: bridge as any,
+      profile: 'default',
+      runQueuedItem,
+    })
+
+    expect(bridge.mcpReload).not.toHaveBeenCalled()
+    expect(runQueuedItem).not.toHaveBeenCalled()
+    expect(namespaceEmit).toHaveBeenCalledWith('session.command', expect.objectContaining({
+      command: 'reload-mcp',
+      ok: false,
+      action: 'reload-mcp',
+      terminal: false,
+      message: 'MCP reload can only run while the session is idle. Wait for the current run to finish or abort it first.',
     }))
   })
 })

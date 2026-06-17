@@ -5,6 +5,7 @@ import { URL } from 'url'
 import { join } from 'path'
 import { bridgeLogger } from '../../logger'
 import { getActiveProfileName, getProfileDir } from '../hermes-profile'
+import type { McpActionResponse } from '../mcp-types'
 
 function resolveDefaultAgentBridgeEndpoint(): string {
   if (process.env.VITEST) {
@@ -48,6 +49,9 @@ export interface AgentBridgeChatOptions {
   source?: string
   wait?: boolean
   timeout?: number
+  /** Local patch (reasoning-effort): per-session reasoning effort override.
+   * Empty/undefined = use config.yaml default. */
+  reasoning_effort?: string
 }
 
 export type AgentBridgeMessage =
@@ -88,6 +92,11 @@ export interface AgentBridgeRunResult extends AgentBridgeResponse {
   events: unknown[]
   result?: unknown
   error?: string | null
+}
+
+export interface AgentBridgeSessionTitle extends AgentBridgeResponse {
+  session_id: string
+  title: string
 }
 
 export interface AgentBridgeContextEstimate extends AgentBridgeResponse {
@@ -414,6 +423,8 @@ export class AgentBridgeClient {
       ...(options.wait ? { wait: true } : {}),
       ...(options.timeout ? { timeout: options.timeout } : {}),
       ...(options.force_compress ? { force_compress: true } : {}),
+      // Local patch (reasoning-effort): per-session reasoning effort override.
+      ...(options.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
     })
   }
 
@@ -459,6 +470,14 @@ export class AgentBridgeClient {
       run_id: runId,
       cursor,
       event_cursor: eventCursor,
+    }, options)
+  }
+
+  getSessionTitle(sessionId: string, profile?: string, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeSessionTitle> {
+    return this.request<AgentBridgeSessionTitle>({
+      action: 'get_session_title',
+      session_id: sessionId,
+      ...(profile ? { profile } : {}),
     }, options)
   }
 
@@ -569,6 +588,14 @@ export class AgentBridgeClient {
     })
   }
 
+  statusIfLoaded(sessionId: string, profile?: string, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeResponse> {
+    return this.request({
+      action: 'status_if_loaded',
+      session_id: sessionId,
+      ...(profile ? { profile } : {}),
+    }, options)
+  }
+
   destroy(sessionId: string, profile?: string, workerKey?: string): Promise<AgentBridgeResponse> {
     return this.request({
       action: 'destroy',
@@ -584,6 +611,36 @@ export class AgentBridgeClient {
 
   shutdown(): Promise<AgentBridgeResponse> {
     return this.request({ action: 'shutdown' }, { serialize: true })
+  }
+
+  // ───── MCP Management ─────
+
+  mcpList(profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_list', ...(profile ? { profile } : {}) })
+  }
+
+  mcpAdd(name: string, config: Record<string, unknown>, profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_server_add', name, config, ...(profile ? { profile } : {}) }, { serialize: true })
+  }
+
+  mcpUpdate(name: string, config: Record<string, unknown>, profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_server_update', name, config, ...(profile ? { profile } : {}) }, { serialize: true })
+  }
+
+  mcpRemove(name: string, profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_server_remove', name, ...(profile ? { profile } : {}) }, { serialize: true })
+  }
+
+  mcpTest(name: string, profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_server_test', name, ...(profile ? { profile } : {}) }, { timeoutMs: 180_000 })
+  }
+
+  mcpTools(server?: string, profile?: string, raw?: boolean): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_tools_list', ...(server ? { server } : {}), ...(profile ? { profile } : {}), ...(raw ? { raw } : {}) })
+  }
+
+  mcpReload(server?: string, profile?: string): Promise<McpActionResponse> {
+    return this.request({ action: 'mcp_reload', ...(server ? { server } : {}), ...(profile ? { profile } : {}) }, { serialize: true })
   }
 }
 

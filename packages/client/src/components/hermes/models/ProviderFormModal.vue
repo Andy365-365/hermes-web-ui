@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, onMounted } from 'vue'
+import { ref, watch, computed, onMounted, nextTick } from 'vue'
 import { NModal, NForm, NFormItem, NInput, NInputNumber, NButton, NSelect, NRadioGroup, NRadioButton, useMessage, useDialog } from 'naive-ui'
 import { useModelsStore } from '@/stores/hermes/models'
 import { useI18n } from 'vue-i18n'
@@ -7,8 +7,11 @@ import CodexLoginModal from './CodexLoginModal.vue'
 import NousLoginModal from './NousLoginModal.vue'
 import CopilotLoginModal from './CopilotLoginModal.vue'
 import XaiOAuthLoginModal from './XaiOAuthLoginModal.vue'
+import AnthropicLoginModal from './AnthropicLoginModal.vue'
+import GeminiLoginModal from './GeminiLoginModal.vue'
 import { checkCopilotToken, enableCopilot, type CopilotTokenSource } from '@/api/hermes/copilot-auth'
 import { fetchProviderModels } from '@/api/hermes/system'
+import { inferApiKeyFunPresetProvider, isApiKeyFunBaseUrl, type ApiKeyFunPresetProvider } from '@/utils/providerBaseUrl'
 
 const { t } = useI18n()
 
@@ -28,6 +31,8 @@ const showCodexLogin = ref(false)
 const showNousLogin = ref(false)
 const showCopilotLogin = ref(false)
 const showXaiLogin = ref(false)
+const showAnthropicLogin = ref(false)
+const showGeminiLogin = ref(false)
 const copilotChecking = ref(false)
 
 const providerType = ref<'preset' | 'custom'>('preset')
@@ -47,7 +52,10 @@ const NOUS_KEY = 'nous'
 const COPILOT_KEY = 'copilot'
 const CLIPROXYAPI_KEY = 'cliproxyapi'
 const XAI_OAUTH_KEY = 'xai-oauth'
+const CLAUDE_OAUTH_KEY = 'claude-oauth'
+const GEMINI_OAUTH_KEY = 'google-gemini-cli'
 const ALIBABA_CODING_KEY = 'alibaba-coding-plan'
+const CUSTOM_STORED_PRESET_KEYS = new Set(['fun-codex', 'fun-claude'])
 const ALIBABA_CODING_REGIONS = {
   intl: 'https://coding-intl.dashscope.aliyuncs.com/v1',
   cn: 'https://coding.dashscope.aliyuncs.com/v1',
@@ -58,6 +66,8 @@ const isNous = computed(() => selectedPreset.value === NOUS_KEY)
 const isCopilot = computed(() => selectedPreset.value === COPILOT_KEY)
 const isCliproxyApi = computed(() => selectedPreset.value === CLIPROXYAPI_KEY)
 const isXaiOAuth = computed(() => selectedPreset.value === XAI_OAUTH_KEY)
+const isClaudeOAuth = computed(() => selectedPreset.value === CLAUDE_OAUTH_KEY)
+const isGeminiOAuth = computed(() => selectedPreset.value === GEMINI_OAUTH_KEY)
 const isAlibabaCoding = computed(() => selectedPreset.value === ALIBABA_CODING_KEY)
 const alibabaCodingRegion = ref<'intl' | 'cn'>('intl')
 
@@ -68,6 +78,18 @@ const selectedPresetProvider = computed(() =>
   selectedPreset.value ? modelsStore.allProviders.find(g => g.provider === selectedPreset.value) : null,
 )
 const canEditPresetBaseUrl = computed(() => !!selectedPresetProvider.value?.base_url_env)
+const canFetchProviderCatalog = computed(() =>
+  !!formData.value.base_url.trim() &&
+  (providerType.value === 'custom' || (
+    providerType.value === 'preset' &&
+    !isCodex.value &&
+    !isNous.value &&
+    !isCopilot.value &&
+    !isXaiOAuth.value &&
+    !isClaudeOAuth.value &&
+    !isGeminiOAuth.value
+  )),
+)
 
 const FUN_LINK_MAP: Record<string, string> = {
   'fun-codex': 'https://apikey.fun/register?aff=LIBAPI',
@@ -76,6 +98,31 @@ const FUN_LINK_MAP: Record<string, string> = {
 
 const funProviderLink = computed(() => selectedPreset.value ? FUN_LINK_MAP[selectedPreset.value] || '' : '')
 
+async function switchToApiKeyFunPreset(providerKey: ApiKeyFunPresetProvider, preferredModel: string) {
+  const apiKey = formData.value.api_key
+  const contextLength = formData.value.context_length
+  providerType.value = 'preset'
+  await nextTick()
+  selectedPreset.value = providerKey
+  await nextTick()
+  formData.value.api_key = apiKey
+  formData.value.context_length = contextLength
+  if (preferredModel) {
+    if (!modelOptions.value.some(option => option.value === preferredModel)) {
+      modelOptions.value = [{ label: preferredModel, value: preferredModel }, ...modelOptions.value]
+    }
+    formData.value.model = preferredModel
+  }
+}
+
+async function routeApiKeyFunCustomProvider(model: string) {
+  if (providerType.value !== 'custom') return
+  if (!isApiKeyFunBaseUrl(formData.value.base_url)) return
+  const providerKey = inferApiKeyFunPresetProvider(model)
+  if (!providerKey) return
+  await switchToApiKeyFunPreset(providerKey, model)
+}
+
 function autoGenerateName(url: string): string {
   const clean = url.replace(/^https?:\/\//, '').replace(/\/v1\/?$/, '')
   const host = clean.split('/')[0]
@@ -83,6 +130,10 @@ function autoGenerateName(url: string): string {
     return t('models.local', { host })
   }
   return host.charAt(0).toUpperCase() + host.slice(1)
+}
+
+function customProviderKey(name: string): string {
+  return `custom:${name.trim().toLowerCase().replace(/ /g, '-')}`
 }
 
 watch(selectedPreset, (val) => {
@@ -103,6 +154,10 @@ watch(selectedPreset, (val) => {
       void triggerCopilotAdd()
     } else if (val === XAI_OAUTH_KEY) {
       showXaiLogin.value = true
+    } else if (val === CLAUDE_OAUTH_KEY) {
+      showAnthropicLogin.value = true
+    } else if (val === GEMINI_OAUTH_KEY) {
+      showGeminiLogin.value = true
     }
   }
 })
@@ -117,6 +172,10 @@ watch(() => formData.value.base_url, (url) => {
   if (providerType.value === 'custom' && url.trim() && !formData.value.name) {
     formData.value.name = autoGenerateName(url.trim())
   }
+})
+
+watch(() => formData.value.model, (model) => {
+  void routeApiKeyFunCustomProvider(model)
 })
 
 watch(providerType, () => {
@@ -140,9 +199,22 @@ async function fetchModels() {
 
   fetchingModels.value = true
   try {
+    const provider = providerType.value === 'preset'
+      ? selectedPreset.value && CUSTOM_STORED_PRESET_KEYS.has(selectedPreset.value)
+        ? customProviderKey(selectedPreset.value)
+        : selectedPreset.value || undefined
+      : formData.value.name.trim()
+        ? customProviderKey(formData.value.name)
+        : undefined
+    const label = providerType.value === 'preset'
+      ? selectedPresetProvider.value?.label || provider
+      : formData.value.name.trim() || provider
     const data = await fetchProviderModels({
       base_url: base_url.trim(),
       api_key: formData.value.api_key.trim(),
+      provider,
+      label,
+      update_cache: !!provider,
     })
     modelOptions.value = data.models.map(m => ({ label: m, value: m }))
     if (modelOptions.value.length > 0 && !formData.value.model) {
@@ -185,11 +257,21 @@ async function handleSave() {
     return
   }
 
+  if (isClaudeOAuth.value) {
+    showAnthropicLogin.value = true
+    return
+  }
+
+  if (isGeminiOAuth.value) {
+    showGeminiLogin.value = true
+    return
+  }
+
   if (!formData.value.base_url.trim()) {
     message.warning(t('models.baseUrlRequired'))
     return
   }
-  if (!formData.value.api_key.trim() && !isCliproxyApi.value && !isXaiOAuth.value) {
+  if (!formData.value.api_key.trim() && !isCliproxyApi.value && !isXaiOAuth.value && !isClaudeOAuth.value && !isGeminiOAuth.value) {
     message.warning(t('models.apiKeyRequired'))
     return
   }
@@ -200,14 +282,22 @@ async function handleSave() {
 
   loading.value = true
   try {
+    const contextLength = formData.value.context_length ?? undefined
+    const apiKeyFunPreset = providerType.value === 'custom' && isApiKeyFunBaseUrl(formData.value.base_url)
+      ? inferApiKeyFunPresetProvider(formData.value.model)
+      : null
     const providerKey = providerType.value === 'preset'
       ? selectedPreset.value
+      : apiKeyFunPreset
+    const presetProvider = apiKeyFunPreset
+      ? modelsStore.allProviders.find(group => group.provider === apiKeyFunPreset)
       : null
+    const baseUrl = presetProvider?.base_url || formData.value.base_url.trim()
+    const providerName = presetProvider?.label || formData.value.name.trim()
 
-    const contextLength = formData.value.context_length ?? undefined
     await modelsStore.addProvider({
-      name: formData.value.name.trim(),
-      base_url: formData.value.base_url.trim(),
+      name: providerName,
+      base_url: baseUrl,
       api_key: formData.value.api_key.trim(),
       model: formData.value.model,
       context_length: contextLength,
@@ -242,6 +332,18 @@ async function handleCopilotSuccess() {
 
 async function handleXaiSuccess() {
   showXaiLogin.value = false
+  message.success(t('models.providerAdded'))
+  emit('saved')
+}
+
+async function handleAnthropicSuccess() {
+  showAnthropicLogin.value = false
+  message.success(t('models.providerAdded'))
+  emit('saved')
+}
+
+async function handleGeminiSuccess() {
+  showGeminiLogin.value = false
   message.success(t('models.providerAdded'))
   emit('saved')
 }
@@ -307,6 +409,16 @@ function handleXaiClose() {
   selectedPreset.value = null
 }
 
+function handleAnthropicClose() {
+  showAnthropicLogin.value = false
+  selectedPreset.value = null
+}
+
+function handleGeminiClose() {
+  showGeminiLogin.value = false
+  selectedPreset.value = null
+}
+
 function handleClose() {
   showModal.value = false
   setTimeout(() => emit('close'), 200)
@@ -319,7 +431,7 @@ function handleClose() {
     preset="card"
     :title="t('models.addProvider')"
     :style="{ width: 'min(520px, calc(100vw - 32px))' }"
-    :mask-closable="!loading && !showCodexLogin && !showNousLogin && !showCopilotLogin && !showXaiLogin"
+    :mask-closable="!loading && !showCodexLogin && !showNousLogin && !showCopilotLogin && !showXaiLogin && !showAnthropicLogin && !showGeminiLogin"
     @after-leave="emit('close')"
   >
     <NForm label-placement="top">
@@ -379,7 +491,7 @@ function handleClose() {
         />
       </NFormItem>
 
-      <NFormItem v-if="!isCodex && !isNous" :label="t('models.apiKey')" :required="!isCliproxyApi && !isXaiOAuth">
+      <NFormItem v-if="!isCodex && !isNous && !isClaudeOAuth && !isGeminiOAuth" :label="t('models.apiKey')" :required="!isCliproxyApi && !isXaiOAuth">
         <NInput
           v-model:value="formData.api_key"
           type="password"
@@ -400,7 +512,7 @@ function handleClose() {
             style="flex: 1"
           />
           <NButton
-            v-if="providerType === 'custom' || (providerType === 'preset' && modelOptions.length === 0)"
+            v-if="canFetchProviderCatalog"
             :loading="fetchingModels"
             @click="fetchModels"
           >
@@ -451,6 +563,18 @@ function handleClose() {
       v-if="showXaiLogin"
       @close="handleXaiClose"
       @success="handleXaiSuccess"
+    />
+
+    <AnthropicLoginModal
+      v-if="showAnthropicLogin"
+      @close="handleAnthropicClose"
+      @success="handleAnthropicSuccess"
+    />
+
+    <GeminiLoginModal
+      v-if="showGeminiLogin"
+      @close="handleGeminiClose"
+      @success="handleGeminiSuccess"
     />
   </NModal>
 </template>
